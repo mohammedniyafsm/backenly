@@ -67,8 +67,18 @@ function cronRequest(secret?: string): any {
   }
 }
 
-async function runScheduler(secret?: string): Promise<{ status: number; body: any }> {
-  const res = await dailyBackupRoute(cronRequest(secret))
+/**
+ * The secret this suite's scheduler holds. A cron route answers only a caller
+ * with the server's CRON_SECRET, and none at all when none is configured
+ * (lib/security/cron-auth.ts), so the suite configures one, as an operator
+ * with an external scheduler does, and the scheduler sends it.
+ */
+const suiteSecret = `cron-${crypto.randomBytes(12).toString('hex')}`
+let operatorSecret: string | undefined
+
+/** One scheduler tick: with this suite's secret unless told otherwise (null sends none). */
+async function runScheduler(secret: string | null = suiteSecret): Promise<{ status: number; body: any }> {
+  const res = await dailyBackupRoute(cronRequest(secret ?? undefined))
   return { status: res.status, body: await res.json() }
 }
 
@@ -80,6 +90,8 @@ async function backupRows() {
 }
 
 beforeAll(async () => {
+  operatorSecret = process.env.CRON_SECRET
+  process.env.CRON_SECRET = suiteSecret
   ;({ GET: dailyBackupRoute } = (await import('@/app/api/cron/daily-backup/route')) as any)
 
   ownerId = (
@@ -111,6 +123,8 @@ beforeAll(async () => {
 
 afterAll(async () => {
   delete process.env.BACKENLY_SCHEDULED_SNAPSHOTS
+  if (operatorSecret === undefined) delete process.env.CRON_SECRET
+  else process.env.CRON_SECRET = operatorSecret
   await prisma.workspaceBackup.deleteMany({ where: { projectId } }).catch(() => {})
   await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {})
   await prisma.project.deleteMany({ where: { userId: ownerId } }).catch(() => {})
@@ -124,26 +138,19 @@ afterAll(async () => {
 describe('1 — default configuration', () => {
   it('does NOT take snapshots when the operator has not asked', async () => {
     delete process.env.BACKENLY_SCHEDULED_SNAPSHOTS
-    // This developer's .env carries a CRON_SECRET, so an unauthenticated call
-    // is refused at the door and never reaches the behaviour under test. The
-    // auth gate has its own test below; this one is about the opt-in.
-    const cronSecret = process.env.CRON_SECRET
-    delete process.env.CRON_SECRET
-    try {
-      const { scheduledSnapshotsEnabled } = await import('@/lib/services/workspace-backup')
-      expect(scheduledSnapshotsEnabled()).toBe(false)
+    // The scheduler sends this suite's secret, so the call passes the door and
+    // reaches the behaviour under test. The auth gate has its own test below;
+    // this one is about the opt-in.
+    const { scheduledSnapshotsEnabled } = await import('@/lib/services/workspace-backup')
+    expect(scheduledSnapshotsEnabled()).toBe(false)
 
-      const run = await runScheduler()
-      expect(run.status).toBe(200)
-      // The scheduler ticked and did nothing, which is the correct answer for
-      // an install that never opted in. An exception once a day would read as a
-      // broken scheduler; silently backing up would be worse.
-      expect(run.body).toMatchObject({ ran: 0, succeeded: 0, failed: 0 })
-      expect(await backupRows()).toHaveLength(0)
-    } finally {
-      if (cronSecret === undefined) delete process.env.CRON_SECRET
-      else process.env.CRON_SECRET = cronSecret
-    }
+    const run = await runScheduler()
+    expect(run.status).toBe(200)
+    // The scheduler ticked and did nothing, which is the correct answer for
+    // an install that never opted in. An exception once a day would read as a
+    // broken scheduler; silently backing up would be worse.
+    expect(run.body).toMatchObject({ ran: 0, succeeded: 0, failed: 0 })
+    expect(await backupRows()).toHaveLength(0)
   }, 300_000)
 
   it('is not enabled by an unrelated truthy-looking value', async () => {
@@ -161,20 +168,27 @@ describe('2, 3 & 4 — enabled, driven by the scheduler, producing a real artifa
     process.env.BACKENLY_SCHEDULED_SNAPSHOTS = 'true'
   })
 
-  it('refuses an unauthenticated scheduler call when a secret is configured', async () => {
-    process.env.CRON_SECRET = `cron-${crypto.randomBytes(6).toString('hex')}`
-    try {
-      const refused = await runScheduler()
-      expect(refused.status).toBe(401)
-      expect(await backupRows()).toHaveLength(0)
+  it('refuses a scheduler call without the secret, and every call when no secret is configured', async () => {
+    const refused = await runScheduler(null)
+    expect(refused.status).toBe(401)
+    expect(await backupRows()).toHaveLength(0)
 
-      // CONTROL: the same call with the secret is accepted, so the refusal is
-      // the gate working rather than the route being broken.
-      const allowed = await runScheduler(process.env.CRON_SECRET)
-      expect(allowed.status).toBe(200)
+    // With no CRON_SECRET configured there is nothing a caller can prove, so
+    // every call is refused, including one that sends the word "undefined"
+    // (until public #772, an unset secret let both in).
+    delete process.env.CRON_SECRET
+    try {
+      expect((await runScheduler(null)).status).toBe(401)
+      expect((await runScheduler('undefined')).status).toBe(401)
     } finally {
-      delete process.env.CRON_SECRET
+      process.env.CRON_SECRET = suiteSecret
     }
+    expect(await backupRows()).toHaveLength(0)
+
+    // CONTROL: the same call with the secret is accepted, so the refusal is
+    // the gate working rather than the route being broken.
+    const allowed = await runScheduler()
+    expect(allowed.status).toBe(200)
   }, 600_000)
 
   it('the SCHEDULER produced a completed record and a file that exists', async () => {
