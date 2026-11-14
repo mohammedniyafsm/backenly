@@ -491,6 +491,42 @@ describe('held by a definer that is not a superuser, as on Amazon RDS', () => {
       await q('ROLLBACK')
     }
   }, 60_000)
+
+  // REASSIGN OWNED hands objects only to a role the caller can SET ROLE to from
+  // PostgreSQL 16.16 (CVE-2026-120146), and needed its privileges before. On RDS
+  // the definer holds ADMIN on the application's role and nothing more.
+  it('drops a read-write login, handing what it owned to an application role the definer only administers', async () => {
+    const definer = `bkn_test_dropper_${hex}`
+    const app = `bkn_test_rdsapp_${hex}`
+    const login = `bkn_rw_${randomBytes(6).toString('hex')}`
+    const table = `dropped_${hex}`
+    await q('BEGIN')
+    try {
+      await q(`CREATE ROLE ${definer} NOLOGIN NOSUPERUSER CREATEROLE`)
+      for (const { rolname } of await q(`SELECT rolname FROM pg_roles WHERE rolname IN ('backenly_external', 'backenly_no_schema_changes')`)) {
+        await q(`GRANT ${rolname} TO ${definer} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`)
+      }
+      for (const fn of ['backenly_direct_create_role(text, text, text, text)', 'backenly_direct_drop_role(text)']) {
+        await q(`ALTER FUNCTION public.${fn} OWNER TO ${definer}`)
+      }
+      await q(`CREATE ROLE ${app} NOLOGIN`)
+      await q(`GRANT ${app} TO ${definer} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE`)
+      await q(`SELECT set_config('backenly.app_role', $1, true)`, [app])
+
+      await q(`SELECT public.backenly_direct_create_role($1, $2, $3, 'READ_WRITE')`, [login, PASSWORD, schema])
+      await q(`CREATE TABLE "${schema}".${table} (id int)`)
+      await q(`ALTER TABLE "${schema}".${table} OWNER TO ${login}`)
+
+      expect(await q(`SELECT public.backenly_direct_drop_role($1) AS gone`, [login])).toEqual([{ gone: true }])
+      expect(await q(`SELECT 1 FROM pg_roles WHERE rolname = $1`, [login])).toEqual([])
+      expect(await q(`SELECT pg_get_userbyid(relowner) AS owner FROM pg_class WHERE oid = to_regclass($1)`, [`"${schema}".${table}`]))
+        .toEqual([{ owner: app }])
+      // What it granted itself to do this, it took back.
+      expect(await q(`SELECT pg_has_role($1, $2, 'SET') AS s, pg_has_role($1, $2, 'USAGE') AS u`, [definer, app])).toEqual([{ s: false, u: false }])
+    } finally {
+      await q('ROLLBACK')
+    }
+  }, 60_000)
 })
 
 describe('on a database dedicated to one project', () => {

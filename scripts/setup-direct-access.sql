@@ -256,8 +256,13 @@ CREATE OR REPLACE FUNCTION public.backenly_direct_drop_role(
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public
 AS $fn$
 DECLARE
-  pol     record;
-  granted boolean := false;
+  pol      record;
+  granted  boolean := false;
+  v_app    text := public.backenly_app_role();
+  took_app boolean := false;
+  had_app  boolean := false;
+  was_i    boolean;
+  was_s    boolean;
 BEGIN
   IF p_role !~ '^bkn_(ro|rw)_[0-9a-f]{12}$' THEN
     RAISE EXCEPTION 'backenly_direct_drop_role: invalid role name %', p_role;
@@ -286,10 +291,40 @@ BEGIN
     EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', pol.policyname, pol.schemaname, pol.tablename);
   END LOOP;
 
+  -- REASSIGN OWNED needs the privileges of the role it hands objects to before
+  -- PostgreSQL 16.16, and the ability to SET ROLE to it from 16.16 (it now
+  -- checks what ALTER ... OWNER TO checks, CVE-2026-120146). On Amazon RDS the
+  -- definer holds ADMIN on the application's role and nothing more, so it
+  -- grants itself both for this call and takes them back below; a grant it
+  -- already made itself (the regional procedure gives it INHERIT) is changed
+  -- for the call and given back as it was, never revoked.
+  IF current_setting('server_version_num')::int >= 160000
+     AND v_app <> current_user
+     AND NOT coalesce((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false)
+     AND NOT (pg_has_role(current_user, v_app, 'USAGE') AND pg_has_role(current_user, v_app, 'SET'))
+     AND pg_has_role(current_user, v_app, 'MEMBER WITH ADMIN OPTION') THEN
+    SELECT (to_jsonb(m) ->> 'inherit_option')::boolean, (to_jsonb(m) ->> 'set_option')::boolean
+      INTO was_i, was_s
+      FROM pg_auth_members m
+     WHERE m.roleid = (SELECT oid FROM pg_roles WHERE rolname = v_app)
+       AND m.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+       AND m.grantor = (SELECT oid FROM pg_roles WHERE rolname = current_user);
+    had_app := FOUND;
+    EXECUTE format('GRANT %I TO %I WITH INHERIT TRUE, SET TRUE', v_app, current_user);
+    took_app := true;
+  END IF;
+
   -- Tables a READ_WRITE role created belong to it — hand them to the platform
   -- role so the backend they describe keeps working after revocation.
-  EXECUTE format('REASSIGN OWNED BY %I TO %I', p_role, public.backenly_app_role());
+  EXECUTE format('REASSIGN OWNED BY %I TO %I', p_role, v_app);
   EXECUTE format('DROP OWNED BY %I', p_role); -- strips remaining grants
+  IF took_app AND had_app THEN
+    EXECUTE format('GRANT %I TO %I WITH INHERIT %s, SET %s', v_app, current_user,
+                   CASE WHEN coalesce(was_i, false) THEN 'TRUE' ELSE 'FALSE' END,
+                   CASE WHEN coalesce(was_s, false) THEN 'TRUE' ELSE 'FALSE' END);
+  ELSIF took_app THEN
+    EXECUTE format('REVOKE %I FROM %I', v_app, current_user);
+  END IF;
 
   -- Whatever still names the role is outside this database (see above): retire it.
   IF EXISTS (
@@ -1025,6 +1060,8 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public
 AS $fn$
 DECLARE
   v_pg16   constant boolean := current_setting('server_version_num')::int >= 160000;
+  v_super  constant boolean := coalesce((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false);
+  v_inherit constant boolean := coalesce((SELECT rolinherit FROM pg_roles WHERE rolname = current_user), false);
   v_owner  text := coalesce(p_owner, 'bkn_own_' || right(p_role, 12));
   v_role   oid;
   v_marked boolean;
@@ -1033,6 +1070,12 @@ DECLARE
   v_become text[] := '{}';
   v_needs  text[] := '{}';
   v_took   text[] := '{}';
+  v_back   text[] := '{}';
+  v_back_i boolean[] := '{}';
+  v_back_s boolean[] := '{}';
+  v_had    boolean;
+  v_was_i  boolean;
+  v_was_s  boolean;
   v_need   text;
   r        record;
 BEGIN
@@ -1099,15 +1142,45 @@ BEGIN
   FOR v_need IN
     SELECT DISTINCT n FROM unnest(v_needs) AS n WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = n)
   LOOP
-    -- Handing objects to the owner role also needs SET on it, from PostgreSQL 16.
-    IF pg_has_role(current_user, v_need, 'USAGE')
-       AND (NOT v_pg16 OR v_need <> v_owner OR pg_has_role(current_user, v_need, 'SET')) THEN
+    -- Held directly, never only through another role: the steps below take
+    -- memberships away (the login's in the owner role comes first), so a path
+    -- through one of them would be gone by the step that needs it, and which
+    -- role DISTINCT yields first would decide whether the strip works. From
+    -- PostgreSQL 16 the grant carries INHERIT, to act with the role's
+    -- privileges, and SET: REASSIGN OWNED and ALTER ... OWNER TO give objects
+    -- only to a role the caller can SET ROLE to (16.16 makes REASSIGN check
+    -- it, CVE-2026-120146). A superuser needs none of it.
+    CONTINUE WHEN v_super OR v_need = current_user;
+    IF EXISTS (SELECT 1 FROM pg_auth_members m
+                WHERE m.roleid = (SELECT oid FROM pg_roles WHERE rolname = v_need)
+                  AND m.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+                  AND CASE WHEN v_pg16 THEN coalesce((to_jsonb(m) ->> 'inherit_option')::boolean, false)
+                                            AND coalesce((to_jsonb(m) ->> 'set_option')::boolean, false)
+                           ELSE v_inherit END) THEN
       CONTINUE;
     END IF;
     CONTINUE WHEN NOT pg_has_role(current_user, v_need, 'MEMBER WITH ADMIN OPTION');
+    -- A grant the definer already made itself, with other options, is changed
+    -- for this call and given back as it was below, never revoked: revoking it
+    -- would take a membership the definer held before (on RDS, its INHERIT on
+    -- the application's role).
+    SELECT (to_jsonb(m) ->> 'inherit_option')::boolean, (to_jsonb(m) ->> 'set_option')::boolean
+      INTO v_was_i, v_was_s
+      FROM pg_auth_members m
+     WHERE m.roleid = (SELECT oid FROM pg_roles WHERE rolname = v_need)
+       AND m.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+       AND m.grantor = (SELECT oid FROM pg_roles WHERE rolname = current_user);
+    v_had := FOUND;
+    CONTINUE WHEN v_had AND NOT v_pg16; -- before 16 a grant has no options to change
     EXECUTE format(CASE WHEN v_pg16 THEN 'GRANT %I TO %I WITH INHERIT TRUE, SET TRUE'
                         ELSE 'GRANT %I TO %I' END, v_need, current_user);
-    v_took := v_took || v_need;
+    IF v_had THEN
+      v_back := v_back || v_need;
+      v_back_i := v_back_i || coalesce(v_was_i, false);
+      v_back_s := v_back_s || coalesce(v_was_s, false);
+    ELSE
+      v_took := v_took || v_need;
+    END IF;
   END LOOP;
 
   IF NOT v_marked THEN
@@ -1148,6 +1221,10 @@ BEGIN
 
   FOREACH v_need IN ARRAY v_took LOOP
     EXECUTE format('REVOKE %I FROM %I', v_need, current_user);
+  END LOOP;
+  FOR i IN 1 .. coalesce(array_length(v_back, 1), 0) LOOP
+    EXECUTE format('GRANT %I TO %I WITH INHERIT %s, SET %s', v_back[i], current_user,
+                   CASE WHEN v_back_i[i] THEN 'TRUE' ELSE 'FALSE' END, CASE WHEN v_back_s[i] THEN 'TRUE' ELSE 'FALSE' END);
   END LOOP;
 
   v_holds := public.backenly_direct_schema_change_holds(p_role);
@@ -1407,6 +1484,14 @@ DECLARE
   failed   text[] := '{}';
   took     text[] := '{}';
   v_pg16   constant boolean := current_setting('server_version_num')::int >= 160000;
+  v_super  constant boolean := coalesce((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false);
+  v_inherit constant boolean := coalesce((SELECT rolinherit FROM pg_roles WHERE rolname = current_user), false);
+  back     text[] := '{}';
+  back_i   boolean[] := '{}';
+  back_s   boolean[] := '{}';
+  v_had    boolean;
+  v_was_i  boolean;
+  v_was_s  boolean;
 BEGIN
   IF NOT public.backenly_direct_shared_database() THEN
     RAISE NOTICE 'direct access: this database is dedicated to one project; its read-write logins keep the schema changes their admin allowed';
@@ -1435,13 +1520,38 @@ BEGIN
       EXECUTE format('GRANT %I TO %I', r.role, public.backenly_app_role());
     END IF;
     CONTINUE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.role);
-    IF pg_has_role(current_user, r.role, 'USAGE') AND (NOT v_pg16 OR pg_has_role(current_user, r.role, 'SET')) THEN
+    -- Held directly, as the strip holds them: the statements below take
+    -- memberships away, so a path through another role could be gone by the
+    -- statement that needs it.
+    CONTINUE WHEN v_super OR r.role = current_user;
+    IF EXISTS (SELECT 1 FROM pg_auth_members m
+                WHERE m.roleid = (SELECT oid FROM pg_roles WHERE rolname = r.role)
+                  AND m.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+                  AND CASE WHEN v_pg16 THEN coalesce((to_jsonb(m) ->> 'inherit_option')::boolean, false)
+                                            AND coalesce((to_jsonb(m) ->> 'set_option')::boolean, false)
+                           ELSE v_inherit END) THEN
       CONTINUE;
     END IF;
     CONTINUE WHEN NOT pg_has_role(current_user, r.role, 'MEMBER WITH ADMIN OPTION');
+    -- A grant the installer already made itself is changed for this run and
+    -- given back as it was below, never revoked (as the strip does).
+    SELECT (to_jsonb(m) ->> 'inherit_option')::boolean, (to_jsonb(m) ->> 'set_option')::boolean
+      INTO v_was_i, v_was_s
+      FROM pg_auth_members m
+     WHERE m.roleid = (SELECT oid FROM pg_roles WHERE rolname = r.role)
+       AND m.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+       AND m.grantor = (SELECT oid FROM pg_roles WHERE rolname = current_user);
+    v_had := FOUND;
+    CONTINUE WHEN v_had AND NOT v_pg16;
     EXECUTE format(CASE WHEN v_pg16 THEN 'GRANT %I TO %I WITH INHERIT TRUE, SET TRUE'
                         ELSE 'GRANT %I TO %I' END, r.role, current_user);
-    took := took || r.role;
+    IF v_had THEN
+      back := back || r.role;
+      back_i := back_i || coalesce(v_was_i, false);
+      back_s := back_s || coalesce(v_was_s, false);
+    ELSE
+      took := took || r.role;
+    END IF;
   END LOOP;
 
   FOR r IN SELECT h.holder, h.item, h.fix FROM public.backenly_direct_shared_holds() h ORDER BY h.step, h.holder, h.item LOOP
@@ -1458,6 +1568,10 @@ BEGIN
 
   FOR r IN SELECT unnest(took) AS role LOOP
     EXECUTE format('REVOKE %I FROM %I', r.role, current_user);
+  END LOOP;
+  FOR i IN 1 .. coalesce(array_length(back, 1), 0) LOOP
+    EXECUTE format('GRANT %I TO %I WITH INHERIT %s, SET %s', back[i], current_user,
+                   CASE WHEN back_i[i] THEN 'TRUE' ELSE 'FALSE' END, CASE WHEN back_s[i] THEN 'TRUE' ELSE 'FALSE' END);
   END LOOP;
 
   IF array_length(failed, 1) > 0 THEN

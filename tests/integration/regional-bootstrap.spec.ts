@@ -796,7 +796,7 @@ describe('a project’s logins, held by the definer as Amazon RDS holds them', (
     const oids = (await rows<{ oid: string }>(superUrl(), `SELECT oid::text AS oid FROM pg_roles WHERE rolname = ANY($1)`, [logins])).map((r) => r.oid)
     expect(oids).toHaveLength(3)
     const others = `SELECT roleid::regrole::text AS role, admin_option, inherit_option, set_option
-                      FROM pg_auth_members WHERE member = $1::regrole AND NOT roleid = ANY($2::oid[]) ORDER BY 1`
+                      FROM pg_auth_members WHERE member = $1::regrole AND NOT roleid = ANY($2::oid[]) ORDER BY 1, 2, 3, 4`
     const adminElsewhere = await rows(superUrl(), others, [ADMIN, oids])
 
     const result = await deleteProjectCompletely(projectId)
